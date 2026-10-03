@@ -79,16 +79,58 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+
+        docs = list(ctx.corpus.docs) if ctx.corpus is not None else []
+
+        def source_for(text):
+            for doc in docs:
+                if doc.body in ctx.observed_text and any(
+                    text in line for line in doc.body.splitlines()
+                ):
+                    return doc.doc_id
+            return None
+
+        kept = []
+        conflict = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+
+            cursor = 0
+            while (join_at := text.find(" và ", cursor)) >= 0:
+                left, right = text[:join_at].strip(), text[join_at + 4 :].strip()
+                left_doc, right_doc = source_for(left), source_for(right)
+                if left_doc and right_doc and left_doc != right_doc:
+                    kept.extend(
+                        [
+                            {**claim, "text": left, "doc_id": left_doc},
+                            {**claim, "text": right, "doc_id": right_doc},
+                        ]
+                    )
+                    conflict = True
+                    break
+                cursor = join_at + 1
+
+        report["claims"] = kept
+        report["citations"] = sorted({claim["doc_id"] for claim in kept if claim.get("doc_id")})
+        if conflict:
+            report["abstain"] = True
+            report["answer"] = "Các nguồn đang mâu thuẫn: " + " | ".join(
+                claim["text"] for claim in kept
+            )
+        elif not kept:
+            report.update(
+                answer="Không đủ căn cứ trong các tài liệu đã đọc để kết luận.",
+                abstain=True,
+                citations=[],
+            )
+        return report
